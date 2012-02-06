@@ -1,0 +1,185 @@
+<?php
+namespace Speedster;
+/**
+ * Speedster
+ *
+ * Speedster — Takes a dynamic approach to caching by determining which components are actually used on a request.
+ * On any subsequent requests, Speedster and loads only those components which are likely to be used. 
+ *
+ * @package    LayoutBuilder
+ * @version    0.1.0
+ * @author     Seabourne Consulting
+ * @license    MIT License
+ * @copyright  2012 Seabourne Consulting
+ * @link       https://mjreich@github.com/mjreich/LayoutBuilder.git
+ */
+
+use \Cumula\BaseComponent as BaseComponent;
+use SqliteDataStore\SqliteDataStore as SqliteDataStore;
+use Cumula\SimpleSchema as SimpleSchema;
+
+class Speedster extends BaseComponent {
+	protected $_component_registry;
+	protected $_accessed;
+	protected $_evented;
+	protected $_registered;
+	public $afterStartup;
+	public $afterPrepare;
+	public $afterPreprocess;
+	public $afterProcess;
+	protected $_cmCache;
+	
+	public function __construct() {
+		parent::__construct();
+		$schema = new SimpleSchema(array('path' => array('type' => 'string'),
+										 'components' => array('type' => 'text')), 'path', 'componentregistry');
+		$config = array(
+			'source_directory' => DATAROOT,
+			'filename' => 'speedster.sqlite'
+		);
+		$this->_component_registry = new SqliteDataStore($schema, $config); 
+		$this->addEventListenerTo('Response', 'ResponsePrepare', 'saveCache');
+		$this->addEventListenerTo('Application', 'BootInit', 'registerForEvents');
+		$this->_evented = array();
+		$this->_accessed = array();
+		$this->_registered = array();
+		$this->afterStartup = false;
+		$this->afterPreprocess = false;
+		$this->afterProcess = false;
+		$this->afterPrepare = false;
+		$this->_cmCache = array();
+	
+		$this->addEventListenerTo('Application', 'BeforeBootStartup', 'checkCache');
+	
+		$afterStartup = &$this->afterStartup;
+		$this->addEventListenerTo('Cumula\Application', 'AfterBootStartup', function() use (&$afterStartup) {
+			$afterStartup = true;
+		}); 
+		$afterPreprocess = &$this->afterPreprocess;
+		$this->addEventListenerTo('Cumula\Application', 'AfterBootPreprocess', function() use (&$afterPreprocess) {
+			$afterPreprocess = true;
+		}); 
+		$afterProcess = &$this->afterProcess;
+		$this->addEventListenerTo('Cumula\Application', 'AfterBootProcess', function() use (&$afterProcess) {
+			$afterProcess = true;
+		}); 
+		$afterPrepare = &$this->afterPrepare;
+		$this->addEventListenerTo('Cumula\Application', 'AfterBootPrepare', function() use (&$afterPrepare) {
+			$afterPrepare = true;
+		}); 
+	}
+	
+	public function checkCache() {
+		$cache = $this->_component_registry->query(array('path' => \I('Request')->fullPath));
+		if(!empty($cache)) {
+			$cm = \I('ComponentManager');
+			//$this->_cmCache['installed'] = $cm->getInstalledComponents();
+			$this->_cmCache['enabled'] = $cm->getEnabledComponents();
+			$cache = (object)$cache[0];
+			$cm->setEnabledComponents(unserialize($cache->components), false);
+			$cmCache = $this->_cmCache;
+			$this->addEventListenerTo('Application', 'AfterBootStartup', function() use ($cmCache){
+				\I('ComponentManager')->setEnabledComponents($cmCache['enabled'], false);
+			});
+			if(\I('Request')->path == '/admin/installed_components')
+			\I('Session')->notice = '<strong>Note</strong>: This list may not reflect what is actually loaded on each request. Speedster is dynamically adjusting the enabled modules for each request.';
+		}
+	}
+	
+	public function registerForEvents() {
+		$this->addEventListenerTo('Application', 'InstanceAccessed', 'catchAccessed');
+		$this->addEventListenerTo('Application', 'EventDispatcherEventDispatched', 'catchDispatched');
+		$this->addEventListenerTo('Response', 'EventDispatcherEventDispatched', 'catchDispatched');
+	}
+	
+	public function install() {
+		\I('ComponentManager')->registerStartupComponent($this);
+	}
+	
+	public function startup() {		
+		$components = \I('ComponentManager')->getEnabledComponents();
+		foreach($components as $component) 
+		{
+			if($component != get_class($this))
+			{
+				$this->addEventListenerTo($component, 'EventDispatcherEventDispatched', 'catchDispatched');
+				$this->addEventListenerTo($component, 'EventListenerRegistered', 'catchRegistered');
+			}
+		}
+	}
+	
+	public function catchDispatched($event, $caller, $event_dispatched, $instance, $handler = FALSE, $level = 0, $data = false) {
+		if(is_array($handler) && isset($handler[1]) && ($handler[1] == 'logEventDispatch' || $handler[1] == 'logInstanceAccessed')) {
+			return false;
+		}
+		
+		$classInstance = get_class($instance);
+		
+		if (is_object($handler))
+		{
+			$handlerClass = get_class($handler);
+		}
+		elseif (is_array($handler) && isset($handler[0]) && is_object($handler[0]))
+		{
+			$handlerClass = get_class($handler[0]);
+		}
+		
+		if ($handler !== FALSE && $handlerClass !== FALSE)
+		{
+			if($this->afterPreprocess) {
+				if(!isset($this->_evented[$classInstance]))
+					$this->_evented[$classInstance] = 0;
+				$this->_evented[$classInstance] = $this->_evented[$classInstance]+1;
+				/*if($handlerClass != 'Closure') {
+					if(!isset($this->_evented[$handlerClass]))
+						$this->_evented[$handlerClass] = 0;
+					$this->_evented[$handlerClass] = $this->_evented[$handlerClass]+1;
+				}*/
+			}
+		}
+	}
+	
+	public function catchAccessed($event, $dispatcher, $instance) {
+		if($this->afterStartup) {
+			$c = \Cumula\Autoloader::absoluteClassName($instance);
+			if(!isset($this->_accessed[$c]))
+				$this->_accessed[$c] = 0;
+			$this->_accessed[$c] = $this->_accessed[$c] + 1;
+		}
+	}
+	
+	public function catchRegistered($event, $dispatcher, $registeredClass, $registeredEvent) {
+		if(!$this->afterStartup) {
+			if(!isset($this->_registered[$registeredClass])) {
+				$this->_registered[$registeredClass] = array();
+			}
+			$this->_registered[$registeredClass][] = get_class($dispatcher);
+		}
+	}
+	
+	public function saveCache() {
+		$cache = $this->_component_registry->query(array('path' => \I('Request')->fullPath));
+		if(empty($cache)) {
+			$classes = array();
+			//$classes = array_merge($classes, array_keys($this->_accessed));
+			$classes = array_merge($classes, array_keys($this->_evented));
+			$finals = array();
+			$cm = \I('ComponentManager');
+			foreach($classes as $class) {
+				$finals[] = $class;
+				$finals = array_merge($finals, $cm->getComponentDependencies(\Cumula\Autoloader::absoluteClassName($class)));
+			}
+			$finals = array_intersect($cm->getEnabledComponents(), $finals);
+			$finals = array_unique($finals);
+			$r = array();
+			foreach($finals as $final) {
+				if(isset($this->_registered[$final]))
+					$finals = array_merge($finals, $this->_registered[$final]);
+			}
+			$obj = new \stdClass();
+			$obj->path = \I('Request')->fullPath;
+			$obj->components = serialize(array_unique($finals));
+			$this->_component_registry->create($obj);
+		}
+	}
+}
