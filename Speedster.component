@@ -42,15 +42,20 @@ class Speedster extends BaseComponent {
 		$this->addEventListenerTo('Application', 'BootInit', 'registerForEvents');
 		$this->_evented = array();
 		$this->_accessed = array();
+		
+		//These are process flags to determine where in the event tree we are
 		$this->_registered = array();
 		$this->afterStartup = false;
 		$this->afterPreprocess = false;
 		$this->afterProcess = false;
 		$this->afterPrepare = false;
+		
+		//Cache to hold the old enabledComponents list.
 		$this->_cmCache = array();
 	
 		$this->addEventListenerTo('Application', 'BeforeBootStartup', 'checkCache');
 	
+		//Responders to set the process flags.
 		$afterStartup = &$this->afterStartup;
 		$this->addEventListenerTo('Cumula\Application', 'AfterBootStartup', function() use (&$afterStartup) {
 			$afterStartup = true;
@@ -69,33 +74,64 @@ class Speedster extends BaseComponent {
 		}); 
 	}
 	
+	/**
+	 * Checks the cache to see if a profile exists.  If it does, it loads it into the ComponentManager before startup.
+	 *
+	 * @return void
+	 * @author Mike Reich
+	 */
 	public function checkCache() {
+		//Check for current record with the path.
 		$cache = $this->_component_registry->query(array('path' => \I('Request')->fullPath));
 		if(!empty($cache)) {
 			$cm = \I('ComponentManager');
-			//$this->_cmCache['installed'] = $cm->getInstalledComponents();
+			
+			//Get the current component list.
 			$this->_cmCache['enabled'] = $cm->getEnabledComponents();
 			$cache = (object)$cache[0];
+			
+			//Set the ComponentManager enabledComponent list.
 			$cm->setEnabledComponents(unserialize($cache->components), false);
 			$cmCache = $this->_cmCache;
+			
+			//Add event listenr to return the list to normal after startup.
 			$this->addEventListenerTo('Application', 'AfterBootStartup', function() use ($cmCache){
 				\I('ComponentManager')->setEnabledComponents($cmCache['enabled'], false);
 			});
+			//Add a notice to the Admin installed components page if enabled.
 			if(\I('Request')->path == '/admin/installed_components')
-			\I('Session')->notice = '<strong>Note</strong>: This list may not reflect what is actually loaded on each request. Speedster is dynamically adjusting the enabled modules for each request.';
+				\I('Session')->notice = '<strong>Note</strong>: This list may not reflect what is actually loaded on each request. Speedster is dynamically adjusting the enabled modules for each request.';
 		}
 	}
 	
+	/**
+	 * Setup catch listeners
+	 *
+	 * @return void
+	 * @author Mike Reich
+	 */
 	public function registerForEvents() {
 		$this->addEventListenerTo('Application', 'InstanceAccessed', 'catchAccessed');
 		$this->addEventListenerTo('Application', 'EventDispatcherEventDispatched', 'catchDispatched');
 		$this->addEventListenerTo('Response', 'EventDispatcherEventDispatched', 'catchDispatched');
 	}
 	
+	/**
+	 * Install self as a startup component
+	 *
+	 * @return void
+	 * @author Mike Reich
+	 */
 	public function install() {
 		\I('ComponentManager')->registerStartupComponent($this);
 	}
 	
+	/**
+	 * Startup function, register for events
+	 *
+	 * @return void
+	 * @author Mike Reich
+	 */
 	public function startup() {		
 		$components = \I('ComponentManager')->getEnabledComponents();
 		foreach($components as $component) 
@@ -108,6 +144,19 @@ class Speedster extends BaseComponent {
 		}
 	}
 	
+	/**
+	 * Main function, accepts incoming events and starts to build the event tree.
+	 *
+	 * @param string $event 
+	 * @param string $caller 
+	 * @param string $event_dispatched 
+	 * @param string $instance 
+	 * @param string $handler 
+	 * @param string $level 
+	 * @param string $data 
+	 * @return void
+	 * @author Mike Reich
+	 */
 	public function catchDispatched($event, $caller, $event_dispatched, $instance, $handler = FALSE, $level = 0, $data = false) {
 		if(is_array($handler) && isset($handler[1]) && ($handler[1] == 'logEventDispatch' || $handler[1] == 'logInstanceAccessed')) {
 			return false;
@@ -126,19 +175,24 @@ class Speedster extends BaseComponent {
 		
 		if ($handler !== FALSE && $handlerClass !== FALSE)
 		{
+			//If after the preprocess phase, start collecting.  Class Instance is the event responder.
 			if($this->afterPreprocess) {
 				if(!isset($this->_evented[$classInstance]))
 					$this->_evented[$classInstance] = 0;
 				$this->_evented[$classInstance] = $this->_evented[$classInstance]+1;
-				/*if($handlerClass != 'Closure') {
-					if(!isset($this->_evented[$handlerClass]))
-						$this->_evented[$handlerClass] = 0;
-					$this->_evented[$handlerClass] = $this->_evented[$handlerClass]+1;
-				}*/
 			}
 		}
 	}
 	
+	/**
+	 * Not used.
+	 *
+	 * @param string $event 
+	 * @param string $dispatcher 
+	 * @param string $instance 
+	 * @return void
+	 * @author Mike Reich
+	 */
 	public function catchAccessed($event, $dispatcher, $instance) {
 		if($this->afterStartup) {
 			$c = \Cumula\Autoloader::absoluteClassName($instance);
@@ -148,7 +202,18 @@ class Speedster extends BaseComponent {
 		}
 	}
 	
+	/**
+	 * Catches event registrations and stores in a separate tree.
+	 *
+	 * @param string $event 
+	 * @param string $dispatcher 
+	 * @param string $registeredClass 
+	 * @param string $registeredEvent 
+	 * @return void
+	 * @author Mike Reich
+	 */
 	public function catchRegistered($event, $dispatcher, $registeredClass, $registeredEvent) {
+		//if during or before startup phase.  registeredClass is the ultimate dispatcher, dispatcher is the responder
 		if(!$this->afterStartup) {
 			if(!isset($this->_registered[$registeredClass])) {
 				$this->_registered[$registeredClass] = array();
@@ -157,14 +222,23 @@ class Speedster extends BaseComponent {
 		}
 	}
 	
+	/**
+	 * Shutdown function which builds the tree, and saves the results.
+	 *
+	 * @return void
+	 * @author Mike Reich
+	 */
 	public function saveCache() {
 		$cache = $this->_component_registry->query(array('path' => \I('Request')->fullPath));
 		if(empty($cache)) {
 			$classes = array();
-			//$classes = array_merge($classes, array_keys($this->_accessed));
+			//Merge in results from the afterPreprocess tree
 			$classes = array_merge($classes, array_keys($this->_evented));
 			$finals = array();
+			
 			$cm = \I('ComponentManager');
+			
+			//Loop through, and grab any dependencies
 			foreach($classes as $class) {
 				$finals[] = $class;
 				$finals = array_merge($finals, $cm->getComponentDependencies(\Cumula\Autoloader::absoluteClassName($class)));
@@ -172,10 +246,14 @@ class Speedster extends BaseComponent {
 			$finals = array_intersect($cm->getEnabledComponents(), $finals);
 			$finals = array_unique($finals);
 			$r = array();
+			
+			//Loop through and grab and responder functions (registered for events of the classes in $finals)
 			foreach($finals as $final) {
 				if(isset($this->_registered[$final]))
 					$finals = array_merge($finals, $this->_registered[$final]);
 			}
+			
+			//Setup an object and save
 			$obj = new \stdClass();
 			$obj->path = \I('Request')->fullPath;
 			$obj->components = serialize(array_unique($finals));
